@@ -36,9 +36,22 @@ namespace IfcToExcelWinForms
             "WEST DOWN","WEST","WEST UP"
         };
 
-        // ── public entry point ──────────────────────────────────────────────────
+        // ── public entry points ────────────────────────────────────────────────
 
+        /// <summary>
+        /// Back-compat: writes output to the provided xlsx path.
+        /// If that path is a template workbook, it will be overwritten.
+        /// </summary>
         public static void Convert(string jsonPath, string xlsxPath)
+        {
+            Convert(jsonPath, xlsxPath, xlsxPath);
+        }
+
+        /// <summary>
+        /// Template mode: reads templateXlsxPath and saves result to outXlsxPath.
+        /// If templateXlsxPath does not exist, a new workbook is created.
+        /// </summary>
+        public static void Convert(string jsonPath, string templateXlsxPath, string outXlsxPath)
         {
             // IDEA StatiCa exports JSON as UTF-16 LE (BOM 0xFF 0xFE).
             // System.Text.Json only accepts UTF-8, so read as text and re-encode.
@@ -92,28 +105,61 @@ namespace IfcToExcelWinForms
                 var wps = BoltWorldPositions(grid);
                 if (wps.Count == 0) continue;
 
-                int? columnPid = null, nonBearingPid = null, anglePid = null;
+                int? columnPid = null, anglePid = null;
+                var nonBearingPids = new List<int>();
+
                 foreach (var cp in grid.GetProperty("connectedParts").EnumerateArray())
                 {
                     int pid = cp.GetProperty("id").GetInt32();
                     if (!plateToBeam.TryGetValue(pid, out var ownerBeam)) continue;
                     int oid = ownerBeam.GetProperty("id").GetInt32();
-                    if (oid == bearingBeamId) columnPid = pid;
-                    else if (plateToAngleBeamId.ContainsKey(pid)) anglePid = pid;
-                    else nonBearingPid = pid;
+
+                    if (oid == bearingBeamId)
+                    {
+                        columnPid = pid;
+                        continue;
+                    }
+
+                    if (plateToAngleBeamId.ContainsKey(pid))
+                    {
+                        anglePid = pid;
+                        continue;
+                    }
+
+                    // candidate web plate(s)
+                    nonBearingPids.Add(pid);
                 }
 
-                if (columnPid.HasValue && nonBearingPid.HasValue)
+                // Choose most likely web plate when multiple candidates exist.
+                // Heuristic: smallest region bbox area.
+                int? bestNonBearingPid = null;
+                double bestArea = double.MaxValue;
+                foreach (int pid in nonBearingPids.Distinct())
                 {
-                    string baseFace = ClassifyGridFace(wps[0]);
+                    if (!allPlates.TryGetValue(pid, out var plate)) continue;
+                    string region = plate.TryGetProperty("region", out var rr) ? (rr.GetString() ?? "") : "";
+                    if (string.IsNullOrWhiteSpace(region)) continue;
+
+                    var (mnX, mxX, mnY, mxY) = ParseRegionBbox(region);
+                    double area = Math.Abs((mxX - mnX) * (mxY - mnY));
+                    if (area > 0 && area < bestArea)
+                    {
+                        bestArea = area;
+                        bestNonBearingPid = pid;
+                    }
+                }
+
+                if (columnPid.HasValue && bestNonBearingPid.HasValue)
+                {
+                    string baseFace = (allPlates.TryGetValue(bestNonBearingPid.Value, out var pSel) ? ClassifyFaceFromPlate(pSel) : ClassifyGridFace(wps[0]));
                     if (!beamGridsByFace.ContainsKey(baseFace))
                         beamGridsByFace[baseFace] = new List<BeamGridInfo>();
                     beamGridsByFace[baseFace].Add(new BeamGridInfo
                     {
                         Positions = wps,
-                        WebPlateId = nonBearingPid.Value,
+                        WebPlateId = bestNonBearingPid.Value,
                         BoltAssembly = GetBoltAssemblyName(grid),
-                        // Fix F: use min Z across ALL bolt positions for stable sorting
+                        // use min Y across ALL bolt positions for stable sorting
                         MinY = wps.Min(p => p.Y),
                         MinX = wps.Min(p => p.X),
                     });
@@ -161,8 +207,6 @@ namespace IfcToExcelWinForms
                     // OffsetFromEdgeOfColumn:
                     // '1' = bolt line is centered on the column face (offset from column edge)
                     // '0' = bolt line is offset perpendicular to the face (offset from column center)
-                    // Test: measure the bolt's distance perpendicular to the face it's on.
-                    // For N/S faces the perpendicular is X; for E/W faces it's Y.
                     string offsetFromEdge;
                     {
                         var wp0 = gi.Positions[0];
@@ -205,14 +249,15 @@ namespace IfcToExcelWinForms
                         AngleBoltTopDistance = angleBoltTop,
                         AngleBoltSpacing = null,
                         BoltSize = boltSize,
-                        AngleOffsetFromBeamEnd = "3/4",
+                        // do NOT clobber template defaults unless you compute these
+                        AngleOffsetFromBeamEnd = null,
                         OffsetFromEdgeOfColumn = offsetFromEdge,
-                        BeamEndOffsetDistance = "1/2",
+                        BeamEndOffsetDistance = null,
                     };
                 }
             }
 
-            WriteExcel(xlsxPath,
+            WriteExcel(templateXlsxPath, outXlsxPath,
                 finalRows.Values.OrderBy(r => Array.IndexOf(FaceOrder, r.Face)).ToList());
         }
 
@@ -255,25 +300,48 @@ namespace IfcToExcelWinForms
             }
             return result;
         }
+        private static string ClassifyFaceFromPlate(JsonElement plateElem)
+        {
+            // Prefer plate normal (axisZ) if present; it's robust even when connection point isn't centered.
+            if (plateElem.ValueKind == JsonValueKind.Object &&
+                plateElem.TryGetProperty("axisZ", out var az) &&
+                az.ValueKind == JsonValueKind.Object &&
+                az.TryGetProperty("x", out var xEl) &&
+                az.TryGetProperty("y", out var yEl))
+            {
+                double nx = xEl.GetDouble();
+                double ny = yEl.GetDouble();
+                if (Math.Abs(ny) >= Math.Abs(nx)) return ny < 0 ? "SOUTH" : "NORTH";
+                return nx < 0 ? "WEST" : "EAST";
+            }
+            // Fallback: use plate origin
+            if (plateElem.TryGetProperty("origin", out var o) &&
+                o.TryGetProperty("x", out var ox) &&
+                o.TryGetProperty("y", out var oy))
+            {
+                double px = ox.GetDouble(), py = oy.GetDouble();
+                if (Math.Abs(py) >= Math.Abs(px)) return py < 0 ? "SOUTH" : "NORTH";
+                return px < 0 ? "WEST" : "EAST";
+            }
+            return "NORTH";
+        }
 
-        private static string ClassifyGridFace((double X, double Y, double Z) wp)
+        static string ClassifyGridFace((double X, double Y, double Z) wp)
         {
             if (Math.Abs(wp.Y) >= Math.Abs(wp.X)) return wp.Y < 0 ? "SOUTH" : "NORTH";
             return wp.X < 0 ? "WEST" : "EAST";
         }
 
+
         private static string ClassifyAngleFace(JsonElement angleBeam)
         {
-            double bY = 0, bX = 0, dY = 0, dX = 0;
+            // Angle beams in IOM are represented as "beams" that contain one or more plates.
+            // Use the first plate's normal (axisZ) to determine global face.
             foreach (var plate in angleBeam.GetProperty("plates").EnumerateArray())
             {
-                double px = plate.GetProperty("origin").GetProperty("x").GetDouble();
-                double py = plate.GetProperty("origin").GetProperty("y").GetDouble();
-                if (Math.Abs(py) > Math.Abs(bY)) { bY = py; dY = py; }
-                if (Math.Abs(px) > Math.Abs(bX)) { bX = px; dX = px; }
+                return ClassifyFaceFromPlate(plate);
             }
-            if (Math.Abs(bY) >= Math.Abs(bX)) return dY < 0 ? "SOUTH" : "NORTH";
-            return dX < 0 ? "WEST" : "EAST";
+            return "NORTH";
         }
 
         private static JsonElement? FindAngleBeamForFace(
@@ -292,6 +360,7 @@ namespace IfcToExcelWinForms
         private static (double MinX, double MaxX, double MinY, double MaxY) ParseRegionBbox(string region)
         {
             var nums = Regex.Matches(region, @"[-+]?(?:\d+\.?\d*|\.\d+)(?:[Ee][-+]?\d+)?");
+            if (nums.Count < 4) return (0, 0, 0, 0);
             double mnX = double.MaxValue, mxX = double.MinValue, mnY = double.MaxValue, mxY = double.MinValue;
             for (int i = 0; i + 1 < nums.Count; i += 2)
             {
@@ -299,6 +368,7 @@ namespace IfcToExcelWinForms
                 double y = double.Parse(nums[i + 1].Value, System.Globalization.CultureInfo.InvariantCulture);
                 if (x < mnX) mnX = x; if (x > mxX) mxX = x; if (y < mnY) mnY = y; if (y > mxY) mxY = y;
             }
+            if (mnX == double.MaxValue) return (0, 0, 0, 0);
             return (mnX, mxX, mnY, mxY);
         }
 
@@ -322,30 +392,57 @@ namespace IfcToExcelWinForms
             return Units.FormatSpacing(relIn);
         }
 
+        /// <summary>
+        /// Computes edge/top distances for a web-plate bolt grid.
+        /// Uses the full bolt pattern in plate-local coords to determine which axis is the bolt-line axis.
+        /// </summary>
         private static (string Edge, string Top) ComputeBoltEdgeTop(
             List<(double X, double Y, double Z)> wps, JsonElement plate, string offsetFromEdge)
         {
             var region = plate.TryGetProperty("region", out var r) ? r.GetString() ?? "" : "";
             var (minX, maxX, minY, maxY) = ParseRegionBbox(region);
-            var (lx0, _) = BoltInPlateLocal(plate, wps[0]);
-            // Fix B: use the smaller of the two edge distances (handles reversed plate orientations)
-            double dxMin = lx0 - minX;
-            double dxMax = maxX - lx0;
-            string edgeStr = Units.InToArchitectural(Units.MmToIn(Math.Min(dxMin, dxMax) * 1000.0));
+            if (minX == 0 && maxX == 0 && minY == 0 && maxY == 0) return ("", "");
 
-            // BoltTop: nearest edge distance across all bolts, rounded to nearest ½"
-            double minDy = wps.Select(wp => {
-                var (_, ly) = BoltInPlateLocal(plate, wp);
-                return Math.Min(ly - minY, maxY - ly);
-            }).Min();
-            double topRounded = Math.Round(Units.MmToIn(minDy * 1000.0) * 2.0) / 2.0;
-            // Fix C: whole-number BoltTop is formatted as plain integer (no inch mark)
-            // when OffsetFromEdgeOfColumn='0'; keeps inch mark when '1'
+            // Convert all bolt world points into the plate's local X/Y system.
+            var locals = wps.Select(wp => BoltInPlateLocal(plate, wp)).ToList();
+            if (locals.Count == 0) return ("", "");
+
+            double spreadX = locals.Max(p => p.Lx) - locals.Min(p => p.Lx);
+            double spreadY = locals.Max(p => p.Ly) - locals.Min(p => p.Ly);
+
+            // boltsRunInY means the bolt line varies more in local Y than X (typical vertical bolt line).
+            bool boltsRunInY = spreadY >= spreadX;
+
+            double edgeMm;
+            double topMm;
+
+            if (boltsRunInY)
+            {
+                double lx = locals.Average(p => p.Lx);
+                edgeMm = Math.Min(lx - minX, maxX - lx) * 1000.0;
+
+                double minDy = locals.Select(p => Math.Min(p.Ly - minY, maxY - p.Ly)).Min();
+                topMm = minDy * 1000.0;
+            }
+            else
+            {
+                double ly = locals.Average(p => p.Ly);
+                edgeMm = Math.Min(ly - minY, maxY - ly) * 1000.0;
+
+                double minDx = locals.Select(p => Math.Min(p.Lx - minX, maxX - p.Lx)).Min();
+                topMm = minDx * 1000.0;
+            }
+
+            string edgeStr = Units.InToArchitectural(Units.MmToIn(edgeMm));
+
+            // BoltTop: rounded to nearest ½".
+            double topRounded = Math.Round(Units.MmToIn(topMm) * 2.0) / 2.0;
             string topStr;
             if (topRounded % 1.0 == 0 && offsetFromEdge == "0")
                 topStr = ((int)topRounded).ToString();
             else
                 topStr = Units.InToArchitectural(topRounded);
+
             return (edgeStr, topStr);
         }
 
@@ -406,43 +503,64 @@ namespace IfcToExcelWinForms
 
         // ── Excel writer ────────────────────────────────────────────────────────
 
-        private static void WriteExcel(string path, List<FaceRow> rows)
+        private static void WriteExcel(string templatePath, string outPath, List<FaceRow> rows)
         {
-            using var wb = new XLWorkbook();
-            var ws = wb.AddWorksheet("Sheet1");
-            string[] headers =
+            XLWorkbook wb;
+            IXLWorksheet ws;
+            bool hasTemplate = !string.IsNullOrWhiteSpace(templatePath) && File.Exists(templatePath);
+
+            if (hasTemplate)
             {
-                "FACE","ACTIVE","Cut Distance From Column","Cut Profile",
-                "Bolt Edge Distance","Bolt Top Distance","Bolt Spacing","Swap Side?",
-                "Cut Rounding Radius","Add Support Angle?","Angle Length","Angle Profile",
-                "Angle Bolt Edge Distance","Angle Bolt Top Distance ","Angle Bolt Spacing",
-                "Bolt Size","Angle Part Number","Angle Room Letter","Angle Offset from Beam End",
-                "Offset from edge of Column?","Beam End Offset Distance"
-            };
-            for (int c = 0; c < headers.Length; c++) ws.Cell(1, c + 1).Value = headers[c];
+                wb = new XLWorkbook(templatePath);
+                ws = wb.Worksheets.FirstOrDefault() ?? wb.AddWorksheet("Sheet1");
+            }
+            else
+            {
+                wb = new XLWorkbook();
+                ws = wb.AddWorksheet("Sheet1");
+                string[] headers =
+                {
+                    "FACE","ACTIVE","Cut Distance From Column","Cut Profile",
+                    "Bolt Edge Distance","Bolt Top Distance","Bolt Spacing","Swap Side?",
+                    "Cut Rounding Radius","Add Support Angle?","Angle Length","Angle Profile",
+                    "Angle Bolt Edge Distance","Angle Bolt Top Distance ","Angle Bolt Spacing",
+                    "Bolt Size","Angle Part Number","Angle Room Letter","Angle Offset from Beam End",
+                    "Offset from edge of Column?","Beam End Offset Distance"
+                };
+                for (int c = 0; c < headers.Length; c++) ws.Cell(1, c + 1).Value = headers[c];
+            }
+
             for (int i = 0; i < rows.Count; i++)
             {
-                var r = rows[i]; int row = i + 2;
+                var r = rows[i];
+                int row = i + 2; // row 1 is header in both template + generated workbooks
+
                 ws.Cell(row, 1).Value = r.Face;
                 ws.Cell(row, 2).Value = r.Active;
                 ws.Cell(row, 3).Value = r.CutDistanceFromColumn;
                 ws.Cell(row, 4).Value = r.CutProfile;
                 ws.Cell(row, 5).Value = r.BoltEdgeDistance;
                 ws.Cell(row, 6).Value = r.BoltTopDistance;
-                ws.Cell(row, 7).Value = r.BoltSpacing;
-                ws.Cell(row, 8).Value = r.SwapSide;
-                ws.Cell(row, 9).Value = r.CutRoundingRadius;
-                // AddSupportAngle: always write as string '1' (matches most targets)
-                ws.Cell(row, 10).Value = r.AddSupportAngle;
 
                 // BoltSpacing: when single-gap (no '*') and offsetFromEdge='0', write as int (no inch mark)
                 if (r.BoltSpacing is string bs && !bs.Contains('*') && r.OffsetFromEdgeOfColumn == "0"
                     && double.TryParse(bs.Replace("\"", ""), System.Globalization.NumberStyles.Any,
                         System.Globalization.CultureInfo.InvariantCulture, out double bsVal)
                     && bsVal % 1.0 == 0)
+                {
                     ws.Cell(row, 7).Value = (int)bsVal;
+                }
                 else
-                    ws.Cell(row, 11).Value = r.AngleLength;
+                {
+                    ws.Cell(row, 7).Value = r.BoltSpacing;
+                }
+
+                ws.Cell(row, 8).Value = r.SwapSide;
+                ws.Cell(row, 9).Value = r.CutRoundingRadius;
+                ws.Cell(row, 10).Value = r.AddSupportAngle;
+
+                // ALWAYS write angle fields
+                ws.Cell(row, 11).Value = r.AngleLength;
                 ws.Cell(row, 12).Value = r.AngleProfile;
                 ws.Cell(row, 13).Value = r.AngleBoltEdgeDistance;
                 ws.Cell(row, 14).Value = r.AngleBoltTopDistance;
@@ -454,11 +572,13 @@ namespace IfcToExcelWinForms
                 ws.Cell(row, 20).Value = r.OffsetFromEdgeOfColumn;
                 ws.Cell(row, 21).Value = r.BeamEndOffsetDistance;
             }
-            ws.Columns().AdjustToContents();
-            wb.SaveAs(path);
-        }
 
-        // ── Supporting types ────────────────────────────────────────────────────
+            if (!hasTemplate)
+                ws.Columns().AdjustToContents();
+
+            wb.SaveAs(outPath);
+            wb.Dispose();
+        }
 
         private class BeamGridInfo
         {
