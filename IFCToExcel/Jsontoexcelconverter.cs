@@ -19,8 +19,8 @@ namespace IfcToExcelWinForms
     ///
     /// Key design decisions
     /// --------------------
-    /// • Angle-grid face uses the ANGLE BEAM's face (not bolt world position) because
-    ///   through-bolts can appear on the opposite column face.
+    /// • Angle-grid face uses the BOLT WORLD POSITION to correctly classify angles
+    ///   on the same face as their parent beam (e.g. SOUTH LEFT, WEST).
     /// • Sub-face labels (WEST DOWN/UP, NORTH LEFT/RIGHT etc.) assigned by grouping
     ///   beam-web grids on the same base face and sorting by Z (E/W) or X (N/S).
     /// • AddSupportAngle, AngleBoltTop written as plain strings to match Excel target.
@@ -70,13 +70,11 @@ namespace IfcToExcelWinForms
                     angleBeams.Add(beam);
             }
 
-            // 3. Classify each angle beam's face; build plate → angle-beam-id lookup
-            var angleBeamFace = new Dictionary<int, string>();
+            // 3. Build plate → angle-beam-id lookup
             var plateToAngleBeamId = new Dictionary<int, int>();
             foreach (var angle in angleBeams)
             {
                 int aid = angle.GetProperty("id").GetInt32();
-                angleBeamFace[aid] = ClassifyAngleFace(angle);
                 foreach (var plate in angle.GetProperty("plates").EnumerateArray())
                     plateToAngleBeamId[plate.GetProperty("id").GetInt32()] = aid;
             }
@@ -84,8 +82,8 @@ namespace IfcToExcelWinForms
             // 4. Process bolt grids
             // base face → list of BeamGridInfo (for sub-face sorting)
             var beamGridsByFace = new Dictionary<string, List<BeamGridInfo>>();
-            // angle-beam face → AngleGridInfo
-            var angleGridByFace = new Dictionary<string, AngleGridInfo>();
+            // base face → list of AngleGridInfo (for sub-face sorting)
+            var angleGridsByFace = new Dictionary<string, List<AngleGridInfo>>();
 
             foreach (var grid in root.GetProperty("boltGrids").EnumerateArray())
             {
@@ -121,18 +119,34 @@ namespace IfcToExcelWinForms
 
                 if (columnPid.HasValue && anglePid.HasValue)
                 {
-                    // Key by angle beam's face to handle through-bolt geometry
+                    // Classify by bolt world position (not angle beam plate origins)
+                    string baseFace = ClassifyGridFace(wps[0]);
                     int angleBeamId = plateToAngleBeamId[anglePid.Value];
-                    if (angleBeamFace.TryGetValue(angleBeamId, out string? af)
-                        && !angleGridByFace.ContainsKey(af))
+                    if (!angleGridsByFace.ContainsKey(baseFace))
+                        angleGridsByFace[baseFace] = new List<AngleGridInfo>();
+                    angleGridsByFace[baseFace].Add(new AngleGridInfo
                     {
-                        angleGridByFace[af] = new AngleGridInfo
-                        {
-                            Positions = wps,
-                            PlateId = anglePid.Value,
-                        };
-                    }
+                        Positions = wps,
+                        PlateId = anglePid.Value,
+                        AngleBeamId = angleBeamId,
+                        BoltAssembly = GetBoltAssemblyName(grid),
+                        MinY = wps.Min(p => p.Y),
+                        MinX = wps.Min(p => p.X),
+                    });
                 }
+            }
+
+            // 4b. Assign angle grids to sub-faces (same sorting logic as beam grids)
+            var angleGridBySubFace = new Dictionary<string, AngleGridInfo>();
+            foreach (var (baseFace, angleGrids) in angleGridsByFace)
+            {
+                bool isEW = baseFace == "EAST" || baseFace == "WEST";
+                var sorted = isEW
+                    ? angleGrids.OrderBy(g => g.MinY).ToList()
+                    : angleGrids.OrderBy(g => g.MinX).ToList();
+                var labels = SubFaceLabels(baseFace, sorted.Count, isEW);
+                for (int i = 0; i < sorted.Count; i++)
+                    angleGridBySubFace[labels[i]] = sorted[i];
             }
 
             // 5. Assign sub-face labels and build FaceRows
@@ -177,19 +191,23 @@ namespace IfcToExcelWinForms
 
                     // Angle data — try sub-face first, then base face
                     string? angleLen = null, angleProf = null, angleBoltEdge = null, angleBoltTop = null;
+                    string? angleBoltSpacing = null, addSupportAngle = null;
 
-                    if (!angleGridByFace.TryGetValue(face, out var agi))
-                        angleGridByFace.TryGetValue(baseFace, out agi);
+                    if (!angleGridBySubFace.TryGetValue(face, out var agi))
+                        angleGridBySubFace.TryGetValue(baseFace, out agi);
 
-                    var angleBeam = FindAngleBeamForFace(angleBeams, angleBeamFace, face, baseFace);
-                    if (angleBeam.HasValue)
-                    {
-                        angleLen = GetAngleLength(angleBeam.Value);
-                        angleProf = GetAngleProfile(angleBeam.Value);
-                    }
                     if (agi != null)
                     {
+                        var angleBeam = angleBeams.FirstOrDefault(ab => ab.GetProperty("id").GetInt32() == agi.AngleBeamId);
+                        if (angleBeam.ValueKind != JsonValueKind.Undefined)
+                        {
+                            angleLen = GetAngleLength(angleBeam);
+                            angleProf = GetAngleProfile(angleBeam);
+                        }
                         (angleBoltEdge, angleBoltTop) = ComputeAngleBoltEdgeTop(agi.Positions, allPlates[agi.PlateId]);
+                        string sp = ComputeBoltSpacing(agi.Positions);
+                        angleBoltSpacing = string.IsNullOrEmpty(sp) ? null : sp;
+                        addSupportAngle = "1";
                     }
 
                     finalRows[face] = finalRows[face] with
@@ -198,16 +216,16 @@ namespace IfcToExcelWinForms
                         BoltEdgeDistance = boltEdge,
                         BoltTopDistance = boltTop,
                         BoltSpacing = boltSpacing,
-                        AddSupportAngle = "1",          // written as int below
+                        AddSupportAngle = addSupportAngle,
                         AngleLength = angleLen,
                         AngleProfile = angleProf,
                         AngleBoltEdgeDistance = angleBoltEdge,
                         AngleBoltTopDistance = angleBoltTop,
-                        AngleBoltSpacing = null,
+                        AngleBoltSpacing = angleBoltSpacing,
                         BoltSize = boltSize,
-                        AngleOffsetFromBeamEnd = "3/4",
+                        AngleOffsetFromBeamEnd = addSupportAngle != null ? "3/4" : null,
                         OffsetFromEdgeOfColumn = offsetFromEdge,
-                        BeamEndOffsetDistance = "1/2",
+                        BeamEndOffsetDistance = addSupportAngle != null ? "1/2" : null,
                     };
                 }
             }
@@ -262,32 +280,6 @@ namespace IfcToExcelWinForms
             return wp.X < 0 ? "WEST" : "EAST";
         }
 
-        private static string ClassifyAngleFace(JsonElement angleBeam)
-        {
-            double bY = 0, bX = 0, dY = 0, dX = 0;
-            foreach (var plate in angleBeam.GetProperty("plates").EnumerateArray())
-            {
-                double px = plate.GetProperty("origin").GetProperty("x").GetDouble();
-                double py = plate.GetProperty("origin").GetProperty("y").GetDouble();
-                if (Math.Abs(py) > Math.Abs(bY)) { bY = py; dY = py; }
-                if (Math.Abs(px) > Math.Abs(bX)) { bX = px; dX = px; }
-            }
-            if (Math.Abs(bY) >= Math.Abs(bX)) return dY < 0 ? "SOUTH" : "NORTH";
-            return dX < 0 ? "WEST" : "EAST";
-        }
-
-        private static JsonElement? FindAngleBeamForFace(
-            List<JsonElement> angleBeams, Dictionary<int, string> angleBeamFace,
-            string subFace, string baseFace)
-        {
-            foreach (var ab in angleBeams)
-            {
-                int id = ab.GetProperty("id").GetInt32();
-                if (angleBeamFace.TryGetValue(id, out string? f) && (f == subFace || f == baseFace))
-                    return ab;
-            }
-            return null;
-        }
 
         private static (double MinX, double MaxX, double MinY, double MaxY) ParseRegionBbox(string region)
         {
@@ -441,8 +433,7 @@ namespace IfcToExcelWinForms
                         System.Globalization.CultureInfo.InvariantCulture, out double bsVal)
                     && bsVal % 1.0 == 0)
                     ws.Cell(row, 7).Value = (int)bsVal;
-                else
-                    ws.Cell(row, 11).Value = r.AngleLength;
+                ws.Cell(row, 11).Value = r.AngleLength;
                 ws.Cell(row, 12).Value = r.AngleProfile;
                 ws.Cell(row, 13).Value = r.AngleBoltEdgeDistance;
                 ws.Cell(row, 14).Value = r.AngleBoltTopDistance;
@@ -473,6 +464,10 @@ namespace IfcToExcelWinForms
         {
             public List<(double X, double Y, double Z)> Positions { get; set; } = new();
             public int PlateId { get; set; }
+            public int AngleBeamId { get; set; }
+            public string BoltAssembly { get; set; } = "";
+            public double MinY { get; set; }
+            public double MinX { get; set; }
         }
     }
 }
