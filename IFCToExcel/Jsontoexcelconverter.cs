@@ -300,7 +300,9 @@ namespace IfcToExcelWinForms
             }
             return result;
         }
-        private static string ClassifyFaceFromPlate(JsonElement plateElem)
+
+        private
+private static string ClassifyFaceFromPlate(JsonElement plateElem)
         {
             // Prefer plate normal (axisZ) if present; it's robust even when connection point isn't centered.
             if (plateElem.ValueKind == JsonValueKind.Object &&
