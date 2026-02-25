@@ -71,16 +71,43 @@ namespace IfcToExcelWinForms
                     allPlates[pid] = plate;
                 }
 
-            // 2. Identify bearing member and angle beams
+            // 2. Identify bearing member (COLUMN) and angle beams
+            // NOTE: Some IOM exports mark multiple members as isBearingMember=true.
+            // We want the COLUMN (typically HSS/box/pipe), not the incoming beams.
             int bearingBeamId = -1;
+            var bearingCandidates = new List<JsonElement>();
+
             var angleBeams = new List<JsonElement>();
             foreach (var beam in root.GetProperty("beams").EnumerateArray())
             {
-                if (beam.GetProperty("isBearingMember").GetBoolean())
-                    bearingBeamId = beam.GetProperty("id").GetInt32();
+                if (beam.TryGetProperty("isBearingMember", out var isBear) && isBear.GetBoolean())
+                    bearingCandidates.Add(beam);
+
                 var csType = beam.GetProperty("crossSectionType").GetString() ?? "";
                 if (csType.Equals("RolledAngle", StringComparison.OrdinalIgnoreCase))
                     angleBeams.Add(beam);
+            }
+
+            if (bearingCandidates.Count > 0)
+            {
+                // Prefer RHS/box/pipe (common columns) over I-shapes (common beams)
+                JsonElement? best = null;
+                foreach (var b in bearingCandidates)
+                {
+                    var csType = b.GetProperty("crossSectionType").GetString() ?? "";
+                    var mprl = b.TryGetProperty("mprlName", out var mp) ? (mp.GetString() ?? "") : "";
+                    bool looksLikeColumn =
+                        csType.Contains("Rhs", StringComparison.OrdinalIgnoreCase) ||
+                        csType.Contains("Box", StringComparison.OrdinalIgnoreCase) ||
+                        csType.Contains("Pipe", StringComparison.OrdinalIgnoreCase) ||
+                        mprl.Contains("HSS", StringComparison.OrdinalIgnoreCase) ||
+                        mprl.Contains("RHS", StringComparison.OrdinalIgnoreCase) ||
+                        mprl.Contains("SHS", StringComparison.OrdinalIgnoreCase);
+
+                    if (looksLikeColumn) { best = b; break; }
+                }
+                best ??= bearingCandidates[0];
+                bearingBeamId = best.Value.GetProperty("id").GetInt32();
             }
 
             // 3. Classify each angle beam's face; build plate → angle-beam-id lookup
@@ -152,9 +179,11 @@ namespace IfcToExcelWinForms
                 if (columnPid.HasValue && bestNonBearingPid.HasValue)
                 {
                     string baseFace =
-        (allPlates.TryGetValue(bestNonBearingPid.Value, out var pSel)
-            ? ClassifyFaceFromPlate(pSel)
-            : ClassifyGridFace(wps[0]));
+                        // Web plate normals can point *away* from the column (toward the beam),
+                        // which flips N/S and E/W. The column face plate normal is the most reliable.
+                        (columnPid.HasValue && allPlates.TryGetValue(columnPid.Value, out var colPlate)
+                            ? ClassifyFaceFromPlate(colPlate)
+                            : ClassifyGridFace(wps[0]));
 
                     File.AppendAllText(
                         Path.ChangeExtension(outXlsxPath, ".debug.txt"),
@@ -170,6 +199,7 @@ namespace IfcToExcelWinForms
                         // use min Y across ALL bolt positions for stable sorting
                         MinY = wps.Min(p => p.Y),
                         MinX = wps.Min(p => p.X),
+                        MinZ = wps.Min(p => p.Z),
                     });
 
                 }
@@ -199,7 +229,7 @@ namespace IfcToExcelWinForms
             {
                 bool isEW = baseFace == "EAST" || baseFace == "WEST";
                 List<BeamGridInfo> sorted = isEW
-                    ? grids.OrderBy(g => g.MinY).ToList()   // E/W: sort by Y (perpendicular to face); most negative Y = DOWN
+                    ? grids.OrderBy(g => g.MinZ).ToList()   // E/W: sort by Z; most negative Z = DOWN
                     : grids.OrderBy(g => g.MinX).ToList();  // N/S: sort by X (perpendicular to face); most negative X = LEFT
                 List<string> faces = SubFaceLabels(baseFace, sorted.Count, isEW);
 
@@ -277,14 +307,14 @@ namespace IfcToExcelWinForms
             if (count == 1) return new List<string> { baseFace };
             return (isEW, baseFace, count) switch
             {
-                (true, "EAST", 2) => new List<string> { "EAST DOWN", "EAST UP" },
-                (true, "EAST", _) => new List<string> { "EAST DOWN", "EAST", "EAST UP" },
+                (true, "EAST", 2) => new List<string> { "EAST UP", "EAST DOWN" },
+                (true, "EAST", _) => new List<string> { "EAST UP", "EAST", "EAST DOWN" },
                 (true, "WEST", 2) => new List<string> { "WEST DOWN", "WEST UP" },
                 (true, "WEST", _) => new List<string> { "WEST DOWN", "WEST", "WEST UP" },
                 (false, "NORTH", 2) => new List<string> { "NORTH LEFT", "NORTH RIGHT" },
                 (false, "NORTH", _) => new List<string> { "NORTH LEFT", "NORTH", "NORTH RIGHT" },
-                (false, "SOUTH", 2) => new List<string> { "SOUTH LEFT", "SOUTH RIGHT" },
-                (false, "SOUTH", _) => new List<string> { "SOUTH LEFT", "SOUTH", "SOUTH RIGHT" },
+                (false, "SOUTH", 2) => new List<string> { "SOUTH RIGHT", "SOUTH LEFT" },
+                (false, "SOUTH", _) => new List<string> { "SOUTH RIGHT", "SOUTH", "SOUTH LEFT" },
                 _ => new List<string> { baseFace },
             };
         }
@@ -597,6 +627,7 @@ namespace IfcToExcelWinForms
             public string BoltAssembly { get; set; } = "";
             public double MinY { get; set; }   // min Y across all bolt positions (E/W sub-face sort)
             public double MinX { get; set; }   // min X across all bolt positions (N/S sub-face sort)
+            public double MinZ { get; set; }   // min Z across all bolt positions (UP/DOWN sort)
         }
 
         private class AngleGridInfo
