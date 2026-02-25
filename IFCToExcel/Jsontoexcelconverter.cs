@@ -151,7 +151,15 @@ namespace IfcToExcelWinForms
 
                 if (columnPid.HasValue && bestNonBearingPid.HasValue)
                 {
-                    string baseFace = (allPlates.TryGetValue(bestNonBearingPid.Value, out var pSel) ? ClassifyFaceFromPlate(pSel) : ClassifyGridFace(wps[0]));
+                    string baseFace =
+        (allPlates.TryGetValue(bestNonBearingPid.Value, out var pSel)
+            ? ClassifyFaceFromPlate(pSel)
+            : ClassifyGridFace(wps[0]));
+
+                    File.AppendAllText(
+                        Path.ChangeExtension(outXlsxPath, ".debug.txt"),
+                        $"gridId={grid.GetProperty("id").GetInt32()}, columnPid={columnPid}, webPid={bestNonBearingPid}, baseFace={baseFace}\n"
+                    );
                     if (!beamGridsByFace.ContainsKey(baseFace))
                         beamGridsByFace[baseFace] = new List<BeamGridInfo>();
                     beamGridsByFace[baseFace].Add(new BeamGridInfo
@@ -163,6 +171,7 @@ namespace IfcToExcelWinForms
                         MinY = wps.Min(p => p.Y),
                         MinX = wps.Min(p => p.X),
                     });
+
                 }
 
                 if (columnPid.HasValue && anglePid.HasValue)
